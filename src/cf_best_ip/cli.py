@@ -11,7 +11,7 @@ best_ip_online_two_stage.py
 3. 第一阶段：TCP connect 快速筛选
 4. 第二阶段：TLS + HTTP 精测，多次采样取中位数
 5. 每个端口输出延迟最低的 Top N
-6. 输出格式兼容 edgetunnel：IP:端口#延迟ms
+6. 输出格式：IP:端口#国家码|优选|延迟ms
 
 只使用 Python 标准库，无第三方依赖。
 
@@ -52,7 +52,7 @@ import ssl
 import statistics
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Iterable, TypeVar
 
@@ -125,6 +125,7 @@ class HttpProbeResult:
     ip: str
     port: int
     latency_ms: float
+    country_code: str | None
     samples: tuple[float, ...]
     status_codes: tuple[int, ...]
 
@@ -135,8 +136,9 @@ class HttpProbeResult:
 
     @property
     def edgetunnel_line(self) -> str:
-        """edgetunnel ADD.txt / 自定义优选 IP 常用格式。"""
-        return f"{self.ip_for_url}:{self.port}#{self.latency_ms:.0f}ms"
+        """自定义优选 IP 常用格式。"""
+        country_code = self.country_code or "XX"
+        return f"{self.ip_for_url}:{self.port}#{country_code}|优选|{self.latency_ms:.0f}ms"
 
     @property
     def debug_line(self) -> str:
@@ -144,6 +146,7 @@ class HttpProbeResult:
         status_text = ",".join(str(x) for x in self.status_codes)
         return (
             f"{self.edgetunnel_line}"
+            f"    country={self.country_code or 'XX'}"
             f"    samples=[{sample_text}]"
             f"    status=[{status_text}]"
         )
@@ -289,6 +292,135 @@ def parse_http_status(status_line: bytes) -> int | None:
     return None
 
 
+CF_COLO_COUNTRIES = {
+    "NRT": "JP",
+    "KIX": "JP",
+    "FUK": "JP",
+    "HKG": "HK",
+    "TPE": "TW",
+    "ICN": "KR",
+    "SIN": "SG",
+    "BKK": "TH",
+    "KUL": "MY",
+    "MNL": "PH",
+    "CGK": "ID",
+    "HAN": "VN",
+    "SGN": "VN",
+    "SYD": "AU",
+    "MEL": "AU",
+    "BNE": "AU",
+    "PER": "AU",
+    "AKL": "NZ",
+    "LAX": "US",
+    "SJC": "US",
+    "SFO": "US",
+    "SEA": "US",
+    "ORD": "US",
+    "DFW": "US",
+    "IAD": "US",
+    "EWR": "US",
+    "JFK": "US",
+    "MIA": "US",
+    "ATL": "US",
+    "DEN": "US",
+    "YVR": "CA",
+    "YYZ": "CA",
+    "YUL": "CA",
+    "MEX": "MX",
+    "LHR": "GB",
+    "MAN": "GB",
+    "AMS": "NL",
+    "FRA": "DE",
+    "MUC": "DE",
+    "CDG": "FR",
+    "MRS": "FR",
+    "MAD": "ES",
+    "BCN": "ES",
+    "LIS": "PT",
+    "MXP": "IT",
+    "FCO": "IT",
+    "ZRH": "CH",
+    "VIE": "AT",
+    "PRG": "CZ",
+    "WAW": "PL",
+    "ARN": "SE",
+    "CPH": "DK",
+    "OSL": "NO",
+    "HEL": "FI",
+    "DUB": "IE",
+    "BRU": "BE",
+    "IST": "TR",
+    "DXB": "AE",
+    "DOH": "QA",
+    "TLV": "IL",
+    "BOM": "IN",
+    "DEL": "IN",
+    "MAA": "IN",
+    "BLR": "IN",
+    "GRU": "BR",
+    "GIG": "BR",
+    "EZE": "AR",
+    "SCL": "CL",
+    "LIM": "PE",
+    "BOG": "CO",
+    "JNB": "ZA",
+    "CPT": "ZA",
+    "NBO": "KE",
+    "LOS": "NG",
+    "CAI": "EG",
+}
+
+
+def parse_trace_country(data: bytes) -> str | None:
+    fields: dict[str, str] = {}
+    text = data.decode("ascii", errors="ignore")
+
+    for line in text.replace("\r", "").split("\n"):
+        key, separator, value = line.partition("=")
+        if separator:
+            fields[key.lower()] = value.strip()
+
+    colo = fields.get("colo", "").upper()
+    country_code = CF_COLO_COUNTRIES.get(colo)
+    if country_code is not None:
+        return country_code
+
+    loc = fields.get("loc", "").upper()
+    if len(loc) == 2 and loc.isalpha():
+        return loc
+
+    return None
+
+
+async def read_response_country(
+    reader: asyncio.StreamReader,
+    *,
+    timeout: float,
+) -> str | None:
+    chunks: list[bytes] = []
+    deadline = time.perf_counter() + timeout
+
+    while sum(len(chunk) for chunk in chunks) < 8192:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            break
+
+        try:
+            chunk = await asyncio.wait_for(reader.read(1024), timeout=remaining)
+        except Exception:
+            break
+
+        if not chunk:
+            break
+
+        chunks.append(chunk)
+        country_code = parse_trace_country(b"".join(chunks))
+        if country_code is not None:
+            return country_code
+
+    return parse_trace_country(b"".join(chunks))
+
+
 def is_good_http_status(status: int | None) -> bool:
     """
     判断 HTTP 状态是否说明 Cloudflare 边缘节点有正常响应。
@@ -411,7 +543,7 @@ async def http_probe_once(
     sni: str,
     path: str,
     timeout: float,
-) -> tuple[float, int] | None:
+) -> tuple[float, int, str | None] | None:
     """
     单次 TLS + HTTP 精测。
 
@@ -428,7 +560,7 @@ async def http_probe_once(
         TCP connect + TLS handshake + HTTP request + 读到 HTTP 状态行
 
     返回：
-        (latency_ms, http_status)
+        (latency_ms, http_status, country_code)
     """
     start = time.perf_counter()
     writer: asyncio.StreamWriter | None = None
@@ -456,15 +588,14 @@ async def http_probe_once(
         writer.write(request.encode("ascii"))
         await asyncio.wait_for(writer.drain(), timeout=timeout)
 
-        # 只读 HTTP 状态行，不读完整响应体。
-        # 读完整响应体会明显拖慢测速。
         status_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
         latency_ms = (time.perf_counter() - start) * 1000
 
         status = parse_http_status(status_line)
 
         if is_good_http_status(status):
-            return latency_ms, status
+            country_code = await read_response_country(reader, timeout=timeout)
+            return latency_ms, status, country_code
 
         return None
 
@@ -503,6 +634,7 @@ async def http_probe_multi_sample(
     """
     latencies: list[float] = []
     status_codes: list[int] = []
+    country_codes: list[str] = []
 
     for i in range(samples):
         result = await http_probe_once(
@@ -514,9 +646,11 @@ async def http_probe_multi_sample(
         )
 
         if result is not None:
-            latency_ms, status = result
+            latency_ms, status, country_code = result
             latencies.append(latency_ms)
             status_codes.append(status)
+            if country_code is not None:
+                country_codes.append(country_code)
 
         if i != samples - 1 and sample_interval > 0:
             await asyncio.sleep(sample_interval)
@@ -524,10 +658,13 @@ async def http_probe_multi_sample(
     if not latencies:
         return None
 
+    country_code = Counter(country_codes).most_common(1)[0][0] if country_codes else None
+
     return HttpProbeResult(
         ip=target.ip,
         port=target.port,
         latency_ms=statistics.median(latencies),
+        country_code=country_code,
         samples=tuple(latencies),
         status_codes=tuple(status_codes),
     )
@@ -875,7 +1012,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     probe_group.add_argument(
         "--tcp-timeout",
         type=float,
-        default=0.8,
+        default=0.4,
         help="TCP 快筛单目标超时秒数",
     )
     probe_group.add_argument(
@@ -901,7 +1038,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     concurrency_group.add_argument(
         "--tcp-concurrency",
         type=int,
-        default=512,
+        default=64,
         help="TCP 快筛全局并发数",
     )
     concurrency_group.add_argument(
