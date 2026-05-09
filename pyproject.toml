@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cf-best-ip"
+version = "0.1.0"
+description = "Cloudflare best IP optimizer with TCP prefilter and TLS/HTTP probing"
+requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "cf-best-ip contributors" }]
+keywords = ["cloudflare", "ip", "latency", "network", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet",
+    "Topic :: System :: Networking",
+]
+
+[project.urls]
+Repository = "https://github.com/luxoee/cf-best-ip"
+
+[project.scripts]
+cf-best-ip = "cf_best_ip.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
