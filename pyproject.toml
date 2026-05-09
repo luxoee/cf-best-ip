@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cf-best-ip"
-version = "0.1.0"
+version = "1.0.1"
 description = "Cloudflare best IP optimizer with TCP prefilter and TLS/HTTP probing"
 requires-python = ">=3.10"
 readme = "README.md"

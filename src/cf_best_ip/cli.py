@@ -54,6 +54,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Awaitable, Callable, Iterable, TypeVar
 
 
@@ -90,11 +91,21 @@ CF_IPV6_CIDRS = [
 ]
 
 DEFAULT_PORTS = [443, 2053, 2083, 2087, 2096, 8443]
+DATA_DIR = Path("data")
+STAGE1_SUCCESS_FILE = DATA_DIR / "stage1_success.txt"
+STAGE2_SUCCESS_FILE = DATA_DIR / "stage2_success.txt"
+FINAL_IP_PORT_FILE = DATA_DIR / "final_ip_port.txt"
+FINAL_EDGETUNNEL_FILE = DATA_DIR / "final_edgetunnel.txt"
 
 
 # -----------------------------------------------------------------------------
 # 2. 数据结构
 # -----------------------------------------------------------------------------
+
+def format_ip_port(ip: str, port: int) -> str:
+    ip_text = f"[{ip}]" if ":" in ip else ip
+    return f"{ip_text}:{port}"
+
 
 @dataclass(frozen=True, slots=True)
 class Target:
@@ -110,6 +121,10 @@ class Target:
     ip: str
     port: int
 
+    @property
+    def line(self) -> str:
+        return format_ip_port(self.ip, self.port)
+
 
 @dataclass(frozen=True, slots=True)
 class TcpProbeResult:
@@ -117,6 +132,10 @@ class TcpProbeResult:
     ip: str
     port: int
     latency_ms: float
+
+    @property
+    def line(self) -> str:
+        return format_ip_port(self.ip, self.port)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +154,10 @@ class HttpProbeResult:
         return f"[{self.ip}]" if ":" in self.ip else self.ip
 
     @property
+    def line(self) -> str:
+        return format_ip_port(self.ip, self.port)
+
+    @property
     def edgetunnel_line(self) -> str:
         """自定义优选 IP 常用格式。"""
         country_code = self.country_code or "XX"
@@ -150,6 +173,25 @@ class HttpProbeResult:
             f"    samples=[{sample_text}]"
             f"    status=[{status_text}]"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class Stage1Result:
+    successful: list[TcpProbeResult]
+    kept_by_port: dict[int, list[TcpProbeResult]]
+
+
+@dataclass(frozen=True, slots=True)
+class Stage2Result:
+    successful: list[HttpProbeResult]
+    final_by_port: dict[int, list[HttpProbeResult]]
+
+
+@dataclass(frozen=True, slots=True)
+class TwoStageResult:
+    stage1_successful: list[TcpProbeResult]
+    stage2_successful: list[HttpProbeResult]
+    final_by_port: dict[int, list[HttpProbeResult]]
 
 
 @dataclass(slots=True)
@@ -215,6 +257,66 @@ def build_candidate_ips(cidrs: Iterable[str], count: int) -> list[str]:
         ips.add(random_ip_from_cidr(cidr))
 
     return list(ips)
+
+
+def build_targets(ips: Iterable[str], ports: Iterable[int]) -> list[Target]:
+    return [Target(ip=ip, port=port) for ip in ips for port in ports]
+
+
+def parse_target_line(text: str) -> Target | None:
+    line = text.strip().split("#", 1)[0].strip()
+    if not line:
+        return None
+
+    if line.startswith("["):
+        end = line.find("]")
+        if end == -1 or end + 2 > len(line) or line[end + 1] != ":":
+            return None
+        ip = line[1:end]
+        port_text = line[end + 2:]
+    else:
+        ip, separator, port_text = line.rpartition(":")
+        if not separator:
+            return None
+
+    try:
+        ipaddress.ip_address(ip)
+        port = int(port_text)
+    except ValueError:
+        return None
+
+    if not 1 <= port <= 65535:
+        return None
+
+    return Target(ip=ip, port=port)
+
+
+def dedupe_targets(targets: Iterable[Target]) -> list[Target]:
+    seen: set[Target] = set()
+    unique: list[Target] = []
+
+    for target in targets:
+        if target in seen:
+            continue
+        seen.add(target)
+        unique.append(target)
+
+    return unique
+
+
+def load_targets_from_file(path: Path) -> list[Target]:
+    if not path.exists():
+        return []
+
+    targets: list[Target] = []
+
+    with path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            target = parse_target_line(raw_line)
+            if target is not None:
+                targets.append(target)
+
+    return dedupe_targets(targets)
 
 
 def load_ips_from_file(path: str) -> list[str]:
@@ -484,24 +586,23 @@ async def tcp_probe_once(target: Target, *, timeout: float) -> TcpProbeResult | 
 
 
 async def stage1_tcp_prefilter(
-    ips: list[str],
+    targets: list[Target],
     ports: list[int],
     *,
     keep_per_port: int,
     concurrency: int,
     timeout: float,
     progress_every: int,
-) -> dict[int, list[TcpProbeResult]]:
+) -> Stage1Result:
     """
     第一阶段主函数：TCP 快筛。
 
     输入：
-        所有 IP 和所有端口。
+        所有 IP:PORT 目标。
 
     输出：
-        每个端口保留 TCP 延迟最低的 keep_per_port 个候选。
+        所有 TCP 成功目标，以及每个端口保留的低延迟候选。
     """
-    targets = [Target(ip=ip, port=port) for ip in ips for port in ports]
 
     async def probe(target: Target) -> TcpProbeResult | None:
         return await tcp_probe_once(target, timeout=timeout)
@@ -529,7 +630,7 @@ async def stage1_tcp_prefilter(
             key=lambda x: x.latency_ms,
         )
 
-    return best_by_port
+    return Stage1Result(successful=raw_results, kept_by_port=best_by_port)
 
 
 # -----------------------------------------------------------------------------
@@ -682,7 +783,7 @@ async def stage2_http_refine(
     sni: str,
     path: str,
     progress_every: int,
-) -> dict[int, list[HttpProbeResult]]:
+) -> Stage2Result:
     """
     第二阶段主函数：TLS + HTTP 精测。
 
@@ -734,7 +835,7 @@ async def stage2_http_refine(
             key=lambda x: x.latency_ms,
         )
 
-    return final_by_port
+    return Stage2Result(successful=raw_results, final_by_port=final_by_port)
 
 
 # -----------------------------------------------------------------------------
@@ -839,7 +940,7 @@ async def run_queue_workers(
 # -----------------------------------------------------------------------------
 
 async def best_ip_two_stage(
-    ips: list[str],
+    targets: list[Target],
     ports: list[int],
     *,
     tcp_keep_per_port: int,
@@ -853,19 +954,19 @@ async def best_ip_two_stage(
     sni: str,
     path: str,
     progress_every: int,
-) -> dict[int, list[HttpProbeResult]]:
+) -> TwoStageResult:
     """
     两阶段在线优选总入口。
     """
     print("===== Stage 1: TCP 快筛 =====")
-    print(f"候选 IP 数量: {len(ips)}")
+    print(f"候选 IP:PORT 数量: {len(targets)}")
     print(f"端口列表: {','.join(map(str, ports))}")
-    print(f"TCP 总任务数: {len(ips) * len(ports)}")
+    print(f"TCP 总任务数: {len(targets)}")
     print(f"TCP 并发: {tcp_concurrency}, TCP 超时: {tcp_timeout}s")
     print()
 
-    tcp_candidates = await stage1_tcp_prefilter(
-        ips=ips,
+    stage1_result = await stage1_tcp_prefilter(
+        targets=targets,
         ports=ports,
         keep_per_port=tcp_keep_per_port,
         concurrency=tcp_concurrency,
@@ -875,7 +976,7 @@ async def best_ip_two_stage(
 
     print("\nTCP 快筛保留数量：")
     for port in ports:
-        print(f"  Port {port}: {len(tcp_candidates.get(port, []))}")
+        print(f"  Port {port}: {len(stage1_result.kept_by_port.get(port, []))}")
 
     print("\n===== Stage 2: TLS + HTTP 精测 =====")
     print(f"每端口最终保留: {top_n}")
@@ -885,8 +986,10 @@ async def best_ip_two_stage(
     print(f"Path: {path}")
     print()
 
-    final_results = await stage2_http_refine(
-        tcp_candidates=tcp_candidates,
+    http_progress_every = 0 if progress_every <= 0 else max(1, progress_every // 5)
+
+    stage2_result = await stage2_http_refine(
+        tcp_candidates=stage1_result.kept_by_port,
         ports=ports,
         top_n=top_n,
         concurrency=http_concurrency,
@@ -895,10 +998,14 @@ async def best_ip_two_stage(
         sample_interval=sample_interval,
         sni=sni,
         path=path,
-        progress_every=max(1, progress_every // 5),
+        progress_every=http_progress_every,
     )
 
-    return final_results
+    return TwoStageResult(
+        stage1_successful=stage1_result.successful,
+        stage2_successful=stage2_result.successful,
+        final_by_port=stage2_result.final_by_port,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -935,9 +1042,44 @@ def format_results(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def save_results(path: str, text: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+def flatten_final_results(results: dict[int, list[HttpProbeResult]], ports: list[int]) -> list[HttpProbeResult]:
+    items: list[HttpProbeResult] = []
+
+    for port in ports:
+        items.extend(results.get(port, []))
+
+    return items
+
+
+def format_ip_port_lines(items: Iterable[Target | TcpProbeResult | HttpProbeResult]) -> str:
+    lines = [item.line for item in items]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def save_results(path: str | Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
         f.write(text)
+
+
+def save_data_outputs(result: TwoStageResult, ports: list[int], *, include_stage_files: bool) -> None:
+    final_items = flatten_final_results(result.final_by_port, ports)
+
+    if include_stage_files:
+        save_results(STAGE1_SUCCESS_FILE, format_ip_port_lines(result.stage1_successful))
+        save_results(STAGE2_SUCCESS_FILE, format_ip_port_lines(result.stage2_successful))
+
+    save_results(FINAL_IP_PORT_FILE, format_ip_port_lines(final_items))
+    save_results(FINAL_EDGETUNNEL_FILE, format_results(result.final_by_port, ports, debug=False))
+
+
+def select_quick_targets(ports: list[int]) -> list[Target]:
+    port_set = set(ports)
+    return [
+        target for target in load_targets_from_file(STAGE1_SUCCESS_FILE)
+        if target.port in port_set
+    ]
 
 
 # -----------------------------------------------------------------------------
@@ -988,6 +1130,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="从文件读取候选 IP；提供后不再随机生成",
+    )
+    ip_group.add_argument(
+        "--all",
+        action="store_true",
+        help="完整执行当前候选 IP:PORT，并覆盖 data 目录下全部结果文件",
     )
 
     probe_group = parser.add_argument_group("测试参数")
@@ -1096,21 +1243,43 @@ async def async_main(args: argparse.Namespace) -> int:
     if args.seed is not None:
         random.seed(args.seed)
 
-    if args.input:
-        ips = load_ips_from_file(args.input)
-        if not ips:
-            print(f"输入文件没有解析到有效 IP: {args.input}", file=sys.stderr)
-            return 2
+    include_stage_files = True
+    tcp_keep_per_port = args.tcp_keep
+
+    if args.all or args.input:
+        if args.input:
+            ips = load_ips_from_file(args.input)
+            if not ips:
+                print(f"输入文件没有解析到有效 IP: {args.input}", file=sys.stderr)
+                return 2
+        else:
+            cidrs = CF_IPV6_CIDRS if args.ipv6 else CF_IPV4_CIDRS
+            ips = build_candidate_ips(cidrs, count=args.count)
+
+        targets = build_targets(ips, args.ports)
+        print("运行模式: 完整模式")
     else:
-        cidrs = CF_IPV6_CIDRS if args.ipv6 else CF_IPV4_CIDRS
-        ips = build_candidate_ips(cidrs, count=args.count)
+        targets = select_quick_targets(args.ports)
+        include_stage_files = False
+
+        if targets:
+            counts_by_port = Counter(target.port for target in targets)
+            tcp_keep_per_port = max(args.tcp_keep, max(counts_by_port.values(), default=0))
+            print("运行模式: 快速模式")
+            print(f"快速模式候选 IP:PORT 数量: {len(targets)}")
+        else:
+            cidrs = CF_IPV6_CIDRS if args.ipv6 else CF_IPV4_CIDRS
+            ips = build_candidate_ips(cidrs, count=args.count)
+            targets = build_targets(ips, args.ports)
+            include_stage_files = True
+            print("运行模式: 完整模式（未找到可用历史结果）")
 
     started = time.perf_counter()
 
-    results = await best_ip_two_stage(
-        ips=ips,
+    result = await best_ip_two_stage(
+        targets=targets,
         ports=args.ports,
-        tcp_keep_per_port=args.tcp_keep,
+        tcp_keep_per_port=tcp_keep_per_port,
         top_n=args.top,
         tcp_concurrency=args.tcp_concurrency,
         http_concurrency=args.http_concurrency,
@@ -1125,11 +1294,14 @@ async def async_main(args: argparse.Namespace) -> int:
 
     elapsed = time.perf_counter() - started
 
-    text = format_results(results, args.ports, debug=args.debug)
+    text = format_results(result.final_by_port, args.ports, debug=args.debug)
 
     print("\n===== 最终优选结果 =====")
     print(text)
     print(f"总耗时: {elapsed:.1f}s")
+
+    save_data_outputs(result, args.ports, include_stage_files=include_stage_files)
+    print(f"data 结果已保存到: {DATA_DIR}")
 
     if args.output:
         save_results(args.output, text)
